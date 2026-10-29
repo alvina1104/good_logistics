@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 import uvicorn
-from mysite.api import auth, user, category, city, deliver, order, product, review, store, warehouse
+from mysite.api import auth, user, category, city, deliver, order, product, review, store, warehouse, ai
 from mysite.admin.setup import setup_admin
 
 
@@ -15,6 +15,7 @@ ware_app.include_router(review.review_router)
 ware_app.include_router(order.order_router)
 ware_app.include_router(warehouse.warehouse_router)
 ware_app.include_router(deliver.deliver_router)
+ware_app.include_router(ai.ai_router)
 setup_admin(ware_app)
 
 

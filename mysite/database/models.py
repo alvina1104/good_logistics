@@ -27,6 +27,7 @@ class User(Base):
     review: Mapped[List["Review"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     order: Mapped[List["Order"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(back_populates="user")
+    store: Mapped[list["Store"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
 
 
 class RefreshToken(Base):
@@ -63,6 +64,9 @@ class Store(Base):
     category: Mapped["Category"] = relationship(back_populates="store")
 
     products: Mapped[List["Product"]] = relationship(back_populates="store")
+
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    owner: Mapped["User | None"] = relationship(back_populates="store")
 
 
 class Product(Base):

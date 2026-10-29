@@ -60,7 +60,13 @@ async def register(user: UserCreateSchema, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Username уже существует")
     if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=400, detail="Email уже существует")
-    user_data = User(username=user.username, email=user.email, password=get_password_hash(user.password), status=RoleChoices.buyer)
+
+    user_data = User(
+        username=user.username,
+        email=user.email,
+        password=get_password_hash(user.password),
+        status=user.status
+    )
     db.add(user_data)
     db.commit()
     db.refresh(user_data)
@@ -114,3 +120,17 @@ async def refresh(refresh_token: str = Query(...), db: Session = Depends(get_db)
 @auth_router.get("/me/", response_model=UserOutSchema)
 async def me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@auth_router.get("/verify/")
+async def verify_token(current_user: User = Depends(get_current_user)):
+    return {
+        "valid": True,
+        "message": "Токен действителен",
+        "user": {
+            "id": current_user.id,
+            "username": current_user.username,
+            "email": current_user.email,
+            "status": current_user.status.value
+        }
+    }

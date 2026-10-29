@@ -36,8 +36,8 @@ async def get_store(store_id: int, db: Session = Depends(get_db)):
 
 @store_router.put("/{store_id}", response_model=StoreOutSchema)
 async def update_store(store_id: int, data: StoreCreateSchema, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if current_user.status != RoleChoices.manager:
-        raise HTTPException(status_code=403, detail="Пока только manager может изменить магазин")
+    if current_user.status not in [RoleChoices.manager, RoleChoices.seller]:
+        raise HTTPException(status_code=403, detail="Только manager и seller может изменить магазин")
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Магазин не найден")

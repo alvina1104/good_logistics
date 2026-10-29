@@ -30,7 +30,7 @@ async def get_orders(db: Session = Depends(get_db), current_user: User = Depends
         return db.query(Order).all()
     if current_user.status == RoleChoices.buyer:
         return db.query(Order).filter(Order.user_id == current_user.id).all()
-    raise HTTPException(status_code=403, detail="Нет доступа к заказам")
+    raise HTTPException(status_code=403, detail="Только заказчик может смотреть свои заказы")
 
 
 @order_router.get("/{order_id}", response_model=OrderOut)
@@ -49,10 +49,10 @@ async def delete_order(order_id: int, db: Session = Depends(get_db), current_use
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Заказ не найден")
-    if current_user.status != RoleChoices.manager and order.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Нет доступа к этому заказу")
     if current_user.status not in [RoleChoices.buyer, RoleChoices.manager]:
         raise HTTPException(status_code=403, detail="Нет доступа к удалению заказа")
+    if current_user.status == RoleChoices.buyer and order.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Нельзя удалить чужой заказ")
     db.delete(order)
     db.commit()
     return {"message": "Заказ успешно удалён"}

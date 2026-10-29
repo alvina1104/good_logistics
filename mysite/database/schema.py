@@ -2,11 +2,13 @@ from datetime import datetime, date
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from mysite.database.models import RoleChoices
 from decimal import Decimal
+from typing import Literal
 
 class UserCreateSchema(BaseModel):
     username: str = Field(min_length=2, max_length=30)
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+    status: RoleChoices = RoleChoices.buyer
 
 
 class UserLoginSchema(BaseModel):
@@ -160,3 +162,17 @@ class DeliverOut(BaseModel):
     warehouse_id: int
 
     model_config = ConfigDict(from_attributes=True)
+
+
+
+class Action(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["create_product", "update_product", "delete_product"]
+    data: dict
+
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=3000)
