@@ -1,378 +1,324 @@
+import re
 from decimal import Decimal
+
 from fastapi import HTTPException
 from langchain_core.tools import tool
+from pydantic import ValidationError
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+
 from mysite.database.models import Product, Store, Category, Order, User, RoleChoices
 from mysite.database.schema import ProductCreate, ProductUpdate, ProductOut, Action
 
 
 def product_to_dict(product: Product):
-    return ProductOut.model_validate(product).model_dump(mode="json")
+    """Товардын базадагы бардык ачык талааларын жана байланышкан аталыштарды кайтарат."""
+    data = ProductOut.model_validate(product).model_dump(mode="json")
+    data["store_name"] = product.store.store_name if product.store else None
+    data["category_name"] = product.category.category_name if product.category else None
+    return data
 
 
 def get_product_or_404(db: Session, product_id: int):
-    if product_id <= 0:
-        raise HTTPException(422, "ID товара должен быть больше нуля")
-
+    if type(product_id) is not int or product_id <= 0:
+        raise HTTPException(422, "Неверный ID товара")
     product = db.get(Product, product_id)
-    if not product:
+    if product is None:
         raise HTTPException(404, "Товар не найден")
-
     return product
 
 
 def check_store_permission(db: Session, user: User, store_id: int):
     if user.status not in (RoleChoices.seller, RoleChoices.manager):
-        raise HTTPException(403, "Только seller или manager может менять товары")
-
+        raise HTTPException(403, "Недостаточно прав")
     store = db.get(Store, store_id)
-    if not store:
+    if store is None:
         raise HTTPException(404, "Магазин не найден")
-
-    if user.status == RoleChoices.seller:
-        if store.owner_id != user.id:
-            raise HTTPException(403, "Можно менять товары только своего магазина")
-
+    if user.status == RoleChoices.seller and store.owner_id != user.id:
+        raise HTTPException(403, "Это не ваш магазин")
     return store
+
+
+def has_ram(description: str, ram_gb: int) -> bool:
+    """Ищет только RAM, а не SSD или другие значения GB."""
+    ram = rf"{ram_gb}\s*(?:GB|ГБ)\b"
+    patterns = [
+        rf"\b(?:RAM|ОЗУ|оперативная память)\s*[:=\-]?\s*{ram}",
+        rf"\b{ram}\s*(?:RAM|ОЗУ|оперативной памяти)\b",
+    ]
+    return any(re.search(p, description or "", re.IGNORECASE) for p in patterns)
+
+
+def has_attribute(description: str, label: str, value: str) -> bool:
+    """Проверяет явно записанные в описании атрибуты."""
+    pattern = rf"\b(?:{label})\s*[:=\-]?\s*{re.escape(value)}\b"
+    return bool(re.search(pattern, description or "", re.IGNORECASE))
 
 
 def search_products(
     db: Session,
     query: str = "",
+    min_price: Decimal | None = None,
     max_price: Decimal | None = None,
     store_id: int | None = None,
     category_id: int | None = None,
+    product_type: str | None = None,
+    is_original: bool | None = None,
+    ram_gb: int | None = None,
+    color: str | None = None,
+    size: str | None = None,
+    strict_max: bool = False,
 ):
-    products_query = db.query(Product)
+    if min_price is not None and min_price < 0:
+        raise HTTPException(422, "Минимальная цена не может быть отрицательной")
+    if max_price is not None and max_price < 0:
+        raise HTTPException(422, "Максимальная цена не может быть отрицательной")
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(422, "Минимальная цена больше максимальной")
+    if ram_gb is not None and ram_gb <= 0:
+        raise HTTPException(422, "RAM должна быть больше нуля")
 
-    if query.strip():
-        word = query.strip()
-        products_query = products_query.filter(
-            or_(
+    products = db.query(Product).options(
+        joinedload(Product.store), joinedload(Product.category)
+    )
+
+    # Универсальный поиск: никаких списков видов товаров в коде.
+    if query.strip() or (product_type and product_type.strip()):
+        products = products.join(Product.category)
+        for word in [query.strip(), (product_type or "").strip()]:
+            if not word:
+                continue
+            products = products.filter(or_(
                 Product.product_name.icontains(word, autoescape=True),
                 Product.description.icontains(word, autoescape=True),
-            )
-        )
+                Category.category_name.icontains(word, autoescape=True),
+            ))
 
+    if min_price is not None:
+        products = products.filter(Product.price >= min_price)
     if max_price is not None:
-        if max_price <= 0:
-            raise HTTPException(422, "Цена должна быть больше нуля")
-        products_query = products_query.filter(Product.price <= max_price)
-
+        products = products.filter(
+            Product.price < max_price if strict_max else Product.price <= max_price
+        )
     if store_id is not None:
-        if not db.get(Store, store_id):
+        if db.get(Store, store_id) is None:
             raise HTTPException(404, "Магазин не найден")
-        products_query = products_query.filter(Product.store_id == store_id)
-
+        products = products.filter(Product.store_id == store_id)
     if category_id is not None:
-        if not db.get(Category, category_id):
+        if db.get(Category, category_id) is None:
             raise HTTPException(404, "Категория не найдена")
-        products_query = products_query.filter(Product.category_id == category_id)
+        products = products.filter(Product.category_id == category_id)
+    if is_original is not None:
+        products = products.filter(Product.is_original == is_original)
 
-    total = products_query.count()
-    products = products_query.order_by(Product.price, Product.id).limit(20).all()
+    found = products.order_by(Product.price.asc(), Product.id.asc()).all()
 
-    items = []
-    for product in products:
-        items.append(product_to_dict(product))
+    # Эти атрибуты пока есть только в description; неизвестное не считаем совпадением.
+    if ram_gb is not None:
+        found = [p for p in found if has_ram(p.description, ram_gb)]
+    if color:
+        found = [p for p in found if has_attribute(p.description, r"цвет|color", color)]
+    if size:
+        found = [p for p in found if has_attribute(p.description, r"размер|size", size)]
 
-    return {
-        "items": items,
-        "total": total,
-        "shown": len(items),
-    }
+    items = [product_to_dict(p) for p in found]
+    return {"items": items, "total": len(items), "shown": len(items)}
 
 
 def count_products(db: Session):
-    return {
-        "count": db.query(Product).count(),
-        "unit": "товары в каталоге, не количество на складе",
-    }
+    return {"count": db.query(Product).count(), "unit": "товары в каталоге"}
 
 
 def get_product(db: Session, product_id: int):
-    product = get_product_or_404(db, product_id)
-    return {"items": [product_to_dict(product)]}
+    return {"items": [product_to_dict(get_product_or_404(db, product_id))]}
 
 
 def compare_products(db: Session, product_ids: list[int]):
-    if not 2 <= len(product_ids) <= 5:
-        raise HTTPException(422, "Укажите от 2 до 5 товаров")
-
-    if len(set(product_ids)) != len(product_ids):
-        raise HTTPException(422, "ID товаров не должны повторяться")
-
-    items = []
-    for product_id in product_ids:
-        product = get_product_or_404(db, product_id)
-        items.append(product_to_dict(product))
-
-    return {"items": items}
+    if not 2 <= len(product_ids) <= 5 or len(set(product_ids)) != len(product_ids):
+        raise HTTPException(422, "Укажите 2–5 разных ID товаров")
+    return {"items": [product_to_dict(get_product_or_404(db, pid)) for pid in product_ids]}
 
 
 def list_stores(db: Session, user: User):
-    stores = db.query(Store).order_by(Store.id).limit(100).all()
-    result = []
-
-    for store in stores:
-        can_edit = False
-
-        if user.status == RoleChoices.manager:
-            can_edit = True
-        elif user.status == RoleChoices.seller:
-            can_edit = store.owner_id == user.id
-
-        result.append({
-            "id": store.id,
-            "name": store.store_name,
-            "category_id": store.category_id,
-            "can_edit": can_edit,
-        })
-
-    return {"stores": result}
+    stores = db.query(Store).order_by(Store.id).all()
+    return {"stores": [
+        {
+            "id": s.id, "name": s.store_name, "category_id": s.category_id,
+            "can_edit": user.status == RoleChoices.manager or (
+                user.status == RoleChoices.seller and s.owner_id == user.id
+            ),
+        }
+        for s in stores
+    ]}
 
 
 def list_categories(db: Session):
-    categories = db.query(Category).order_by(Category.id).limit(100).all()
-    result = []
-
-    for category in categories:
-        result.append({
-            "id": category.id,
-            "name": category.category_name,
-        })
-
-    return {"categories": result}
+    return {"categories": [
+        {"id": c.id, "name": c.category_name}
+        for c in db.query(Category).order_by(Category.id).all()
+    ]}
 
 
 def validate_action(db: Session, user: User, action: Action):
     if user.status not in (RoleChoices.seller, RoleChoices.manager):
-        raise HTTPException(403, "Нет прав на изменение товаров")
+        raise HTTPException(403, "Недостаточно прав")
 
     if action.operation == "create_product":
-        for field in action.data:
-            if field not in ProductCreate.model_fields:
-                raise HTTPException(422, f"Неизвестное поле: {field}")
-
+        if set(action.data) != set(ProductCreate.model_fields):
+            # is_original has a default, so it may be omitted.
+            required = {"product_name", "price", "description", "store_id", "category_id"}
+            if not required.issubset(action.data) or not set(action.data).issubset(ProductCreate.model_fields):
+                raise HTTPException(422, "Некорректные поля товара")
         data = ProductCreate.model_validate(action.data)
         check_store_permission(db, user, data.store_id)
-
-        if not db.get(Category, data.category_id):
+        if db.get(Category, data.category_id) is None:
             raise HTTPException(404, "Категория не найдена")
-
         return data.model_dump()
 
-    if action.operation == "update_product":
-        if set(action.data) != {"product_id", "changes"}:
-            raise HTTPException(422, "Укажите product_id и changes")
-
-    if action.operation == "delete_product":
-        if user.status != RoleChoices.manager:
-            raise HTTPException(403, "Только manager может удалить товар")
-
-        if set(action.data) != {"product_id"}:
-            raise HTTPException(422, "Укажите только product_id")
-
-    product_id = action.data.get("product_id")
-    if type(product_id) is not int:
-        raise HTTPException(422, "product_id должен быть целым числом")
-
-    product = get_product_or_404(db, product_id)
+    if set(action.data) != ({"product_id", "changes"} if action.operation == "update_product" else {"product_id"}):
+        raise HTTPException(422, "Некорректные поля операции")
+    product = get_product_or_404(db, action.data["product_id"])
     check_store_permission(db, user, product.store_id)
 
     if action.operation == "update_product":
         changes = action.data["changes"]
-
-        if not isinstance(changes, dict):
-            raise HTTPException(422, "changes должен быть объектом")
-
-        for field in changes:
-            if field not in ProductUpdate.model_fields:
-                raise HTTPException(422, f"Неизвестное поле: {field}")
-
-        data = ProductUpdate.model_validate(changes)
-        values = data.model_dump(exclude_unset=True)
-
-        if not values:
-            raise HTTPException(422, "Укажите поля для изменения")
-
-        for value in values.values():
-            if value is None:
-                raise HTTPException(422, "Поля товара не могут быть null")
-
+        if not isinstance(changes, dict) or not changes or not set(changes).issubset(ProductUpdate.model_fields):
+            raise HTTPException(422, "Некорректные поля изменения")
+        values = ProductUpdate.model_validate(changes).model_dump(exclude_unset=True)
+        if any(v is None for v in values.values()):
+            raise HTTPException(422, "Поля не могут быть null")
         if "store_id" in values:
             check_store_permission(db, user, values["store_id"])
-
-        if "category_id" in values:
-            if not db.get(Category, values["category_id"]):
-                raise HTTPException(404, "Категория не найдена")
-
+        if "category_id" in values and db.get(Category, values["category_id"]) is None:
+            raise HTTPException(404, "Категория не найдена")
         return values
 
-    order = db.query(Order).filter(Order.product_id == product.id).first()
-    if order:
-        raise HTTPException(409, "Нельзя удалить товар, связанный с заказами")
+    if action.operation == "delete_product":
+        if db.query(Order).filter(Order.product_id == product.id).first():
+            raise HTTPException(409, "Товар связан с заказами")
+        return {}
 
-    return {}
-
-
-def prepare_action(db: Session, user: User, action: Action):
-    validate_action(db, user, action)
-
-    result = {
-        "requires_confirmation": True,
-        "action": action.model_dump(mode="json"),
-    }
-
-    if action.operation != "create_product":
-        product = get_product_or_404(db, action.data["product_id"])
-        result["before"] = product_to_dict(product)
-
-    return result
+    raise HTTPException(422, "Неизвестная операция")
 
 
 def execute_action(db: Session, user: User, action: Action):
-    values = validate_action(db, user, action)
-
-    if action.operation == "create_product":
-        product = Product(**values)
-        db.add(product)
-        db.flush()
-        db.refresh(product)
-
-        return {
-            "message": "Товар создан",
-            "item": product_to_dict(product),
-        }
-
-    product = get_product_or_404(db, action.data["product_id"])
-
-    if action.operation == "update_product":
-        for key, value in values.items():
-            setattr(product, key, value)
-
-        db.flush()
-        db.refresh(product)
-
-        return {
-            "message": "Товар изменён",
-            "item": product_to_dict(product),
-        }
-
-    product_id = product.id
-    db.delete(product)
-    db.flush()
-
-    return {
-        "message": "Товар удалён",
-        "product_id": product_id,
-    }
+    try:
+        values = validate_action(db, user, action)
+        if action.operation == "create_product":
+            product = Product(**values)
+            db.add(product)
+            db.flush()
+            db.refresh(product)
+            result = {"message": "Товар создан", "items": [product_to_dict(product)]}
+        else:
+            product = get_product_or_404(db, action.data["product_id"])
+            if action.operation == "update_product":
+                for field, value in values.items():
+                    setattr(product, field, value)
+                db.flush()
+                db.refresh(product)
+                result = {"message": "Товар изменён", "items": [product_to_dict(product)]}
+            else:
+                product_id = product.id
+                db.delete(product)
+                db.flush()
+                result = {"message": f"Товар ID {product_id} удалён", "items": []}
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_tools(db: Session, user: User):
-
     @tool
     def list_products_tool():
-        """Показывает первые 20 товаров и общее количество товаров."""
+        """Показывает товары каталога со всеми доступными полями."""
         return search_products(db)
 
     @tool
     def search_products_tool(query: str):
-        """Ищет товары по названию или описанию. Используй короткие слова."""
+        """Ищет товары по названию, описанию и категории."""
         return search_products(db, query=query)
 
     @tool
     def filter_products_tool(
+        min_price: Decimal | None = None,
         max_price: Decimal | None = None,
         store_id: int | None = None,
         category_id: int | None = None,
+        product_type: str | None = None,
+        is_original: bool | None = None,
+        ram_gb: int | None = None,
+        color: str | None = None,
+        size: str | None = None,
+        strict_max: bool = False,
     ):
-        """Фильтрует товары по цене, магазину и категории."""
+        """Фильтрует товары. Для 'дешевле' используй strict_max=True; для 'до' — False.
+        product_type — произвольное слово из запроса, не список фиксированных видов.
+        """
         return search_products(
-            db,
-            max_price=max_price,
-            store_id=store_id,
-            category_id=category_id,
+            db, min_price=min_price, max_price=max_price, store_id=store_id,
+            category_id=category_id, product_type=product_type,
+            is_original=is_original, ram_gb=ram_gb, color=color,
+            size=size, strict_max=strict_max,
         )
 
     @tool
     def recommend_products_tool(query: str, max_price: Decimal | None = None):
-        """Находит товары для рекомендации по запросу и бюджету."""
+        """Подбирает реальные товары по тексту и бюджету."""
         return search_products(db, query=query, max_price=max_price)
 
     @tool
-    def get_product_tool(product_id: int):
-        """Показывает товар по его ID."""
-        return get_product(db, product_id)
-
-    @tool
     def count_products_tool():
-        """Считает записи товаров в каталоге, не складские остатки."""
+        """Считает количество записей каталога."""
         return count_products(db)
 
     @tool
+    def get_product_tool(product_id: int):
+        """Возвращает все доступные данные товара по ID."""
+        return get_product(db, product_id)
+
+    @tool
     def compare_products_tool(product_ids: list[int]):
-        """Возвращает данные от 2 до 5 товаров для сравнения."""
+        """Сравнивает 2–5 товаров."""
         return compare_products(db, product_ids)
 
     @tool
     def list_stores_tool():
-        """Показывает магазины и возможность менять их товары."""
+        """Список магазинов и доступность редактирования."""
         return list_stores(db, user)
 
     @tool
     def list_categories_tool():
-        """Показывает категории товаров и их ID."""
+        """Список категорий и их ID."""
         return list_categories(db)
 
-    @tool
-    def prepare_create_product_tool(data: ProductCreate):
-        """Готовит создание товара для подтверждения. Не сохраняет товар."""
-        action = Action(
-            operation="create_product",
-            data=data.model_dump(mode="json"),
-        )
-        return prepare_action(db, user, action)
-
-    @tool
-    def prepare_update_product_tool(product_id: int, changes: ProductUpdate):
-        """Готовит изменение товара для подтверждения. Не меняет товар."""
-        action = Action(
-            operation="update_product",
-            data={
-                "product_id": product_id,
-                "changes": changes.model_dump(mode="json", exclude_unset=True),
-            },
-        )
-        return prepare_action(db, user, action)
-
-    @tool
-    def prepare_delete_product_tool(product_id: int):
-        """Готовит удаление товара. Только manager. Не удаляет товар."""
-        action = Action(
-            operation="delete_product",
-            data={"product_id": product_id},
-        )
-        return prepare_action(db, user, action)
-
     tools = [
-        list_products_tool,
-        search_products_tool,
-        filter_products_tool,
-        recommend_products_tool,
-        get_product_tool,
-        count_products_tool,
-        compare_products_tool,
-        list_stores_tool,
-        list_categories_tool,
+        list_products_tool, search_products_tool, filter_products_tool,
+        recommend_products_tool, count_products_tool, get_product_tool,
+        compare_products_tool, list_stores_tool, list_categories_tool,
     ]
 
     if user.status in (RoleChoices.seller, RoleChoices.manager):
-        tools.append(prepare_create_product_tool)
-        tools.append(prepare_update_product_tool)
+        @tool
+        def create_product_tool(data: ProductCreate):
+            """Сразу создаёт товар после проверки прав и данных."""
+            return execute_action(db, user, Action(operation="create_product", data=data.model_dump(mode="json")))
 
-    if user.status == RoleChoices.manager:
-        tools.append(prepare_delete_product_tool)
+        @tool
+        def update_product_tool(product_id: int, changes: ProductUpdate):
+            """Сразу изменяет разрешённый товар."""
+            return execute_action(db, user, Action(operation="update_product", data={
+                "product_id": product_id,
+                "changes": changes.model_dump(mode="json", exclude_unset=True),
+            }))
+
+        @tool
+        def delete_product_tool(product_id: int):
+            """Сразу удаляет свой товар (seller) или любой товар (manager), если нет заказов."""
+            return execute_action(db, user, Action(operation="delete_product", data={"product_id": product_id}))
+
+        tools.extend([create_product_tool, update_product_tool, delete_product_tool])
 
     return tools

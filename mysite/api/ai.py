@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+
 from mysite.api.auth import get_current_user
 from mysite.database.db import get_db
 from mysite.database.models import User, RoleChoices
@@ -18,7 +19,7 @@ def ai_user(user: User = Depends(get_current_user)):
         RoleChoices.seller,
         RoleChoices.manager,
     ):
-        raise HTTPException(403, "AI доступен buyer, seller и manager")
+        raise HTTPException(403, "Нет доступа к AI Chat")
 
     return user
 
@@ -40,17 +41,24 @@ def execute(
 ):
     try:
         result = execute_action(db, user, data)
-        db.commit()
-        return result
+
+        return {
+            "answer": result["message"],
+            "items": result.get("items", []),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
 
     except ValidationError:
         db.rollback()
-        raise HTTPException(422, "Некорректные данные операции")
+        raise HTTPException(422, "Некорректные данные товара")
 
     except IntegrityError:
         db.rollback()
-        raise HTTPException(409, "Операция нарушает связи данных")
+        raise HTTPException(409, "Нарушены связи данных")
 
-    except Exception:
+    except SQLAlchemyError:
         db.rollback()
-        raise
+        raise HTTPException(500, "Ошибка базы данных")
